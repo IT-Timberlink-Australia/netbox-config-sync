@@ -1,0 +1,74 @@
+---
+- name: Compare NetBox vs Aruba CX Configs
+  hosts: localhost  # Runs on AWX server
+  vars:
+    netbox_url: "https://netbox.example.com"
+    netbox_token: "your_api_token"
+    switch_name: "aruba-switch1"  # NetBox device name
+
+  tasks:
+    - name: Get device data from NetBox
+      uri:
+        url: "{{ netbox_url }}/api/dcim/devices/?name={{ switch_name }}"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+          Accept: "application/json"
+        validate_certs: no
+      register: netbox_device
+      changed_when: false
+
+    - name: Render Jinja2 template (from NetBox data)
+      template:
+        src: "aruba_cx_template.j2"  # Your Jinja2 template
+        dest: "/tmp/rendered_config.txt"
+      vars:
+        device: "{{ netbox_device.json.results[0] }}"
+
+    - name: Fetch live config from Aruba CX
+      arubaoss_command:
+        commands: "show running-config"
+        provider:
+          host: "{{ netbox_device.json.results[0].primary_ip.address.split('/')[0] }}"
+          username: "{{ ansible_user }}"
+          password: "{{ ansible_password }}"
+          use_ssl: yes
+          validate_certs: no
+      register: live_config
+
+    - name: Save live config to file
+      copy:
+        content: "{{ live_config.stdout[0] }}"
+        dest: "/tmp/live_config.txt"
+      changed_when: false
+
+    - name: Compare configurations
+      delegate_to: localhost
+      command: >
+        diff --color=always -u /tmp/live_config.txt /tmp/rendered_config.txt
+      register: config_diff
+      ignore_errors: yes
+      changed_when: config_diff.rc == 1  # Diff found
+
+    - name: Display differences
+      debug:
+        msg: "{{ config_diff.stdout_lines }}"
+      when: config_diff.rc == 1
+
+    - name: Create HTML diff report
+      community.general.jdiff:
+        a_file: "/tmp/live_config.txt"
+        b_file: "/tmp/rendered_config.txt"
+        output: "/tmp/config_diff.html"
+      when: config_diff.rc == 1
+
+    - name: Send email notification (if differences)
+      community.general.mail:
+        host: "smtp.timberlinkaustralia.com.au"
+        port: 25
+        to: "cjones@timberlinkaustralia.com.au"
+        subject: "Config Drift Detected on {{ switch_name }}"
+        body: "See attached diff report"
+        attach:
+          - "/tmp/config_diff.html"
+      when: config_diff.rc == 1
